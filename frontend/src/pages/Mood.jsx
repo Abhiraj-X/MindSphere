@@ -91,7 +91,7 @@ const Mood = () => {
             <motion.button key={e.key} onClick={() => setPicked(e.key)} data-testid={`mood-${e.key}`}
               whileHover={{ scale: 1.15 }} whileTap={{ scale: 0.95 }}
               className={`flex flex-col items-center gap-2 transition ${picked === e.key ? "" : "opacity-70"}`}>
-              <MoodBubble color={e.color} size={picked === e.key ? 64 : 52} />
+              <MoodBubble color={e.color} size={picked === e.key ? 64 : 52} decorative />
               <span className="text-xs text-white/60">{e.emoji} {e.label}</span>
             </motion.button>
           ))}
