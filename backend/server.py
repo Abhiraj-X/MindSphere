@@ -1,4 +1,4 @@
-"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + Emergent LLM)."""
+"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + Emergent LLM + Gemini Live)."""
 import os
 import uuid
 import logging
@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -19,6 +19,8 @@ import bcrypt
 import jwt
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+from google import genai as google_genai
+from google.genai import types as gtypes
 
 # ---------- bootstrap ----------
 ROOT_DIR = Path(__file__).parent
@@ -29,6 +31,8 @@ DB_NAME = os.environ["DB_NAME"]
 EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -1298,6 +1302,215 @@ async def guidance(feature: str, user=Depends(current_user)):
 @api.get("/meditations")
 async def meditations(user=Depends(current_user)):
     return MEDITATIONS
+
+
+# ============================================================
+# GEMINI LIVE — Realtime voice WebSocket relay
+# ============================================================
+gemini_live_client = google_genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+async def build_voice_system_prompt(user_id: str) -> str:
+    """Build a per-user Lyra system prompt with full mental wellness context."""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
+    if not user:
+        return "You are Lyra, a warm mental wellness companion. Be calm, helpful, and concise."
+    name = user.get("name", "friend").split(" ")[0]
+    onb = user.get("onboarding", {})
+    style = user.get("preferences", {}).get("style", "warm")
+    lyra_name = user.get("preferences", {}).get("lyra_name", "Lyra")
+    journals = await db.journal.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(5).to_list(5)
+    moods = await db.mood.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(7).to_list(7)
+    j_brief = "; ".join([f"({j.get('emotion')}) {j.get('content','')[:100]}" for j in journals]) or "no entries yet"
+    m_brief = ", ".join([f"{m.get('emotion')}({m.get('intensity')})" for m in moods]) or "none"
+    return (
+        f"You are {lyra_name}, a warm, evidence-based mental wellness companion having a real-time voice conversation with {name}. "
+        f"Style: {style}. Speak naturally — like a calm, technical-but-friendly friend who is reassuring. "
+        f"Use micro-pauses, vary pacing for warmth, and respond conversationally. "
+        f"Keep replies under 3 sentences unless asked. Use evidence-based CBT and mindfulness. "
+        f"NEVER replace professional care — gently suggest a clinician if you detect crisis signals. "
+        f"You can recognize voice commands: 'done', 'next', 'repeat', 'show again', 'i'm stuck', 'zoom in', 'explain slower' — respond appropriately. "
+        f"User context: goal={onb.get('primary_goal')}, energy={onb.get('energy_level')}/10, "
+        f"sleep_hours={onb.get('sleep_hours')}, religion={onb.get('religion','spiritual')}. "
+        f"Recent journal entries: {j_brief}. Recent moods: {m_brief}. "
+        f"Open the conversation by gently referencing one specific recent journal theme. Keep the opener under 25 words."
+    )
+
+
+def _user_from_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+@app.websocket("/api/voice/ws")
+async def voice_websocket(websocket: WebSocket, token: str = Query(...)):
+    """
+    Production-grade Gemini Live API relay.
+
+    Client → Server messages (JSON):
+      {"type":"audio","data": base64 PCM16 LE @ 16kHz mono}
+      {"type":"text","text": "..."}                 — send text input turn
+      {"type":"activity_start"}                     — user started speaking (interrupt)
+      {"type":"activity_end"}                       — user stopped speaking (end of turn)
+      {"type":"ping"}                               — keepalive
+
+    Server → Client messages (JSON):
+      {"type":"audio","data": base64 PCM16 LE @ 24kHz mono}
+      {"type":"text","text": "...", "role":"assistant"|"user"}   — transcript
+      {"type":"interrupted"}
+      {"type":"turn_complete"}
+      {"type":"setup_complete"}
+      {"type":"error","error":"..."}
+    """
+    await websocket.accept()
+    user_id = _user_from_token(token)
+    if not user_id or not gemini_live_client:
+        await websocket.send_json({"type": "error", "error": "auth or gemini key missing"})
+        await websocket.close()
+        return
+
+    system_prompt = await build_voice_system_prompt(user_id)
+
+    # Live API config — flash native audio for low latency
+    config = {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "input_audio_transcription": {},
+        "output_audio_transcription": {},
+        "realtime_input_config": {
+            # Server-side VAD by default; client also drives activity_start/end
+            "automatic_activity_detection": {"disabled": False},
+        },
+        "speech_config": {
+            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}},
+        },
+    }
+
+    log.info("voice ws: user=%s starting Gemini Live (model=%s)", user_id, GEMINI_LIVE_MODEL)
+
+    try:
+        async with gemini_live_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as session:
+            await websocket.send_json({"type": "setup_complete"})
+
+            # --- pump 1: client → gemini ---
+            async def client_to_gemini():
+                try:
+                    while True:
+                        raw = await websocket.receive_text()
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        t = msg.get("type")
+                        if t == "audio":
+                            b64 = msg.get("data") or ""
+                            if not b64:
+                                continue
+                            try:
+                                audio_bytes = base64.b64decode(b64)
+                            except Exception:
+                                continue
+                            await session.send_realtime_input(
+                                audio=gtypes.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+                            )
+                        elif t == "text":
+                            text = (msg.get("text") or "").strip()
+                            if text:
+                                await session.send_client_content(
+                                    turns=[{"role": "user", "parts": [{"text": text}]}],
+                                    turn_complete=True,
+                                )
+                        elif t == "activity_start":
+                            try: await session.send_realtime_input(activity_start=gtypes.ActivityStart())
+                            except Exception: pass
+                        elif t == "activity_end":
+                            try: await session.send_realtime_input(activity_end=gtypes.ActivityEnd())
+                            except Exception: pass
+                        elif t == "ping":
+                            await websocket.send_json({"type": "pong"})
+                except WebSocketDisconnect:
+                    raise
+                except Exception as e:
+                    log.exception("client_to_gemini error: %s", e)
+                    raise
+
+            # --- pump 2: gemini → client ---
+            async def gemini_to_client():
+                try:
+                    async for response in session.receive():
+                        # Audio data + transcripts arrive via server_content
+                        sc = getattr(response, "server_content", None)
+                        if sc is None:
+                            continue
+                        # interruption signal
+                        if getattr(sc, "interrupted", False):
+                            await websocket.send_json({"type": "interrupted"})
+                        # input transcription
+                        in_tx = getattr(sc, "input_transcription", None)
+                        if in_tx and getattr(in_tx, "text", None):
+                            await websocket.send_json({"type": "text", "role": "user", "text": in_tx.text})
+                        # output transcription
+                        out_tx = getattr(sc, "output_transcription", None)
+                        if out_tx and getattr(out_tx, "text", None):
+                            await websocket.send_json({"type": "text", "role": "assistant", "text": out_tx.text})
+                        # audio output (model_turn.parts[].inline_data.data)
+                        mt = getattr(sc, "model_turn", None)
+                        if mt and getattr(mt, "parts", None):
+                            for part in mt.parts:
+                                inline = getattr(part, "inline_data", None)
+                                if inline and getattr(inline, "data", None):
+                                    b64 = base64.b64encode(inline.data).decode("ascii")
+                                    await websocket.send_json({"type": "audio", "data": b64})
+                                txt = getattr(part, "text", None)
+                                if txt:
+                                    await websocket.send_json({"type": "text", "role": "assistant", "text": txt})
+                        if getattr(sc, "turn_complete", False):
+                            await websocket.send_json({"type": "turn_complete"})
+                except WebSocketDisconnect:
+                    raise
+                except Exception as e:
+                    log.exception("gemini_to_client error: %s", e)
+                    try: await websocket.send_json({"type": "error", "error": str(e)[:200]})
+                    except Exception: pass
+                    raise
+
+            # Send opener trigger so Gemini speaks first
+            try:
+                await session.send_client_content(
+                    turns=[{"role": "user", "parts": [{"text": "(Begin our voice session. Greet me by name and gently reference one recent journal theme.)"}]}],
+                    turn_complete=True,
+                )
+            except Exception:
+                pass
+
+            t1 = asyncio.create_task(client_to_gemini())
+            t2 = asyncio.create_task(gemini_to_client())
+            done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            for tk in pending:
+                tk.cancel()
+    except WebSocketDisconnect:
+        log.info("voice ws: client disconnected user=%s", user_id)
+    except Exception as e:
+        log.exception("voice ws error: %s", e)
+        try: await websocket.send_json({"type": "error", "error": str(e)[:200]})
+        except Exception: pass
+    finally:
+        try: await websocket.close()
+        except Exception: pass
+
+
+@api.get("/voice/config")
+async def voice_config(user=Depends(current_user)):
+    """Return non-secret config for the voice client."""
+    return {
+        "model": GEMINI_LIVE_MODEL,
+        "input_sample_rate": 16000,
+        "output_sample_rate": 24000,
+        "available": bool(GEMINI_API_KEY),
+    }
 
 
 @api.get("/resources")

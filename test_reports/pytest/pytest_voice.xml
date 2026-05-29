@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="8" time="32.725" timestamp="2026-05-29T15:31:05.506484+00:00" hostname="agent-env-9fc55697-22d3-4407-b00e-866ef263bce4"><testcase classname="test_voice_ws.TestVoiceConfig" name="test_config_authed" time="0.626" /><testcase classname="test_voice_ws.TestVoiceConfig" name="test_config_unauthed" time="0.156" /><testcase classname="test_voice_ws.TestVoiceWebSocket" name="test_connect_setup_complete_and_opener" time="10.618" /><testcase classname="test_voice_ws.TestVoiceWebSocket" name="test_ping_pong" time="10.167"><failure message="websockets.exceptions.ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)">test_voice_ws.py:110: in test_ping_pong
+    await ws.send(json.dumps({"type": "ping"}))
+/root/.venv/lib/python3.11/site-packages/websockets/asyncio/connection.py:478: in send
+    async with self.send_context():
+/usr/local/lib/python3.11/contextlib.py:210: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+/root/.venv/lib/python3.11/site-packages/websockets/asyncio/connection.py:965: in send_context
+    raise self.protocol.close_exc from original_exc
+E   websockets.exceptions.ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)</failure></testcase><testcase classname="test_voice_ws.TestVoiceWebSocket" name="test_text_turn_produces_audio_and_turn_complete" time="10.462"><failure message="websockets.exceptions.ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)">test_voice_ws.py:138: in test_text_turn_produces_audio_and_turn_complete
+    msgs = await _collect_until(ws, {"turn_complete"}, max_seconds=45)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test_voice_ws.py:71: in _collect_until
+    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.11/asyncio/tasks.py:489: in wait_for
+    return fut.result()
+           ^^^^^^^^^^^^
+/root/.venv/lib/python3.11/site-packages/websockets/asyncio/connection.py:324: in recv
+    raise self.protocol.close_exc from self.recv_exc
+E   websockets.exceptions.ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)</failure></testcase><testcase classname="test_voice_ws.TestVoiceWebSocket" name="test_bad_token_closes" time="0.260" /><testcase classname="test_voice_ws.TestAudioWorkletFiles" name="test_mic_capture_served" time="0.152" /><testcase classname="test_voice_ws.TestAudioWorkletFiles" name="test_pcm_playback_served" time="0.149" /></testsuite></testsuites>
